@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"go.mau.fi/util/exsync"
 	"go.mau.fi/util/ffmpeg"
 	"go.mau.fi/util/jsontime"
@@ -46,7 +47,6 @@ import (
 	"go.mau.fi/webp"
 	"golang.org/x/exp/maps"
 	_ "golang.org/x/image/webp"
-	"golang.org/x/net/html"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -118,10 +118,10 @@ func (tc *TelegramClient) HandleMatrixViewingChat(ctx context.Context, msg *brid
 	if err != nil {
 		return err
 	}
-	err = tc.pollSponsoredMessage(ctx, msg.Portal)
-	if err != nil {
-		return err
-	}
+	//err = tc.pollSponsoredMessage(ctx, msg.Portal)
+	//if err != nil {
+	//	return err
+	//}
 	return nil
 }
 
@@ -180,61 +180,24 @@ func (tc *TelegramClient) pollSponsoredMessage(ctx context.Context, portal *brid
 		msg = msgs.Messages[1]
 	}
 	meta.SponsoredMessageRandomID = msg.RandomID
-	content := tc.parseBodyAndHTML(ctx, msg.Message, msg.Entities)
-	content.MsgType = event.MsgNotice
-	content.EnsureHasHTML()
-	extra := map[string]any{
-		"external_url": msg.URL,
-		"fi.mau.telegram.sponsored": map[string]any{
-			"random_id":       msg.RandomID,
-			"url":             msg.URL,
-			"button_text":     msg.ButtonText,
-			"title":           msg.Title,
-			"content":         content.FormattedBody,
-			"sponsor_info":    msg.SponsorInfo,
-			"additional_info": msg.AdditionalInfo,
-			"recommended":     msg.Recommended,
-		},
-	}
-	var fromStr string
-	if msg.SponsorInfo != "" {
-		fromStr = fmt.Sprintf(" from %s", html.EscapeString(msg.SponsorInfo))
-	}
-	prefix := "Ad"
-	if msg.Recommended {
-		prefix = "Recommended"
-	}
-	content.FormattedBody = fmt.Sprintf(
-		`<strong>%s: %s</strong><blockquote>%s</blockquote><p>Sponsored message%s - <a href="%s">%s</a></p>`,
-		prefix, html.EscapeString(msg.Title), content.FormattedBody, fromStr, msg.URL, msg.ButtonText,
-	)
-	sendResp, err := tc.main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
-		Raw:    extra,
-		Parsed: content,
-	}, &bridgev2.MatrixSendExtra{Timestamp: time.Now()})
-	if err != nil {
-		return fmt.Errorf("failed to send sponsored message: %w", err)
-	}
-	oldSponsoredMessageMXID := meta.SponsoredMessageEventID
-	if oldSponsoredMessageMXID != "" {
-		_, err = tc.main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventRedaction, &event.Content{
-			Parsed: &event.RedactionEventContent{
-				Reason:  "new sponsored message sent",
-				Redacts: oldSponsoredMessageMXID,
-			},
-			Raw: map[string]any{
-				"com.beeper.dont_render_redacted_placeholder": true,
-			},
-		}, &bridgev2.MatrixSendExtra{Timestamp: time.Now()})
-		if err != nil {
-			zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to redact old sponsored message after sending new one")
+
+	randomID := meta.SponsoredMessageRandomID
+	if randomID != nil &&
+		time.Since(meta.SponsoredMessagePollTS.Time) < 15*time.Minute &&
+		meta.sponsoredMessageSeen.Add(tc.telegramUserID) {
+		_, viewSponsoredErr := tc.client.API().MessagesViewSponsoredMessage(ctx, randomID)
+		if viewSponsoredErr != nil {
+			log.Err(viewSponsoredErr).Msg("Failed to mark sponsored message as viewed after read receipt")
+		} else {
+			log.Debug().
+				Str("random_id", base64.StdEncoding.EncodeToString(randomID)).
+				Msg("Marked sponsored message as viewed after read receipt")
 		}
 	}
-	meta.SponsoredMessageEventID = sendResp.EventID
+
 	zerolog.Ctx(ctx).Debug().
-		Stringer("event_id", sendResp.EventID).
 		Str("random_id", base64.StdEncoding.EncodeToString(msg.RandomID)).
-		Msg("Sent sponsored message to Matrix")
+		Msg("Told telegram to fuck off")
 	err = portal.Save(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to save portal after sending sponsored messages: %w", err)
@@ -963,22 +926,22 @@ func (tc *TelegramClient) HandleMatrixReadReceipt(ctx context.Context, msg *brid
 				MaxID:   maxID,
 			})
 
-			meta := msg.Portal.Metadata.(*PortalMetadata)
-			randomID := meta.SponsoredMessageRandomID
-			if !tc.metadata.IsBot &&
-				randomID != nil &&
-				time.Since(meta.SponsoredMessagePollTS.Time) < 15*time.Minute &&
-				(meta.SponsoredMessageEventID == msg.EventID || msg.Receipt.Timestamp.After(meta.SponsoredMessagePollTS.Time)) &&
-				meta.sponsoredMessageSeen.Add(tc.telegramUserID) {
-				_, viewSponsoredErr := tc.client.API().MessagesViewSponsoredMessage(ctx, randomID)
-				if viewSponsoredErr != nil {
-					log.Err(viewSponsoredErr).Msg("Failed to mark sponsored message as viewed after read receipt")
-				} else {
-					log.Debug().
-						Str("random_id", base64.StdEncoding.EncodeToString(randomID)).
-						Msg("Marked sponsored message as viewed after read receipt")
-				}
-			}
+			//meta := msg.Portal.Metadata.(*PortalMetadata)
+			//randomID := meta.SponsoredMessageRandomID
+			//if !tc.metadata.IsBot &&
+			//	randomID != nil &&
+			//	time.Since(meta.SponsoredMessagePollTS.Time) < 15*time.Minute &&
+			//	(meta.SponsoredMessageEventID == msg.EventID || msg.Receipt.Timestamp.After(meta.SponsoredMessagePollTS.Time)) &&
+			//	meta.sponsoredMessageSeen.Add(tc.telegramUserID) {
+			//	_, viewSponsoredErr := tc.client.API().MessagesViewSponsoredMessage(ctx, randomID)
+			//	if viewSponsoredErr != nil {
+			//		log.Err(viewSponsoredErr).Msg("Failed to mark sponsored message as viewed after read receipt")
+			//	} else {
+			//		log.Debug().
+			//			Str("random_id", base64.StdEncoding.EncodeToString(randomID)).
+			//			Msg("Marked sponsored message as viewed after read receipt")
+			//	}
+			//}
 		default:
 			readMessagesErr = fmt.Errorf("unknown peer type %s", peerType)
 		}
@@ -990,10 +953,10 @@ func (tc *TelegramClient) HandleMatrixReadReceipt(ctx context.Context, msg *brid
 		if err != nil {
 			log.Err(err).Msg("failed to poll for reactions after read receipt")
 		}
-		err = tc.pollSponsoredMessage(ctx, msg.Portal)
-		if err != nil {
-			log.Err(err).Msg("failed to poll for sponsored message after read receipt")
-		}
+		//err = tc.pollSponsoredMessage(ctx, msg.Portal)
+		//if err != nil {
+		//	log.Err(err).Msg("failed to poll for sponsored message after read receipt")
+		//}
 	}()
 
 	if peerType == ids.PeerTypeChannel && !msg.Portal.Metadata.(*PortalMetadata).FullSynced {
