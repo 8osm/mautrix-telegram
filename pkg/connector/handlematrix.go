@@ -1392,6 +1392,8 @@ func (tc *TelegramClient) HandleMatrixMembership(ctx context.Context, msg *bridg
 		case bridgev2.Invite, bridgev2.AcceptKnock:
 			if targetInputUser == nil {
 				return nil, wrapUnsupportedError(fmt.Errorf("can't invite non-user peer type %s", targetPeerType))
+			} else if tc.metadata.IsBot {
+				return nil, wrapUnsupportedError(fmt.Errorf("can't invite users as a bot"))
 			}
 			_, err = tc.client.API().ChannelsInviteToChannel(ctx, &tg.ChannelsInviteToChannelRequest{
 				Channel: inputChannel,
@@ -1419,6 +1421,8 @@ func (tc *TelegramClient) HandleMatrixMembership(ctx context.Context, msg *bridg
 		case bridgev2.Invite, bridgev2.AcceptKnock:
 			if targetInputUser == nil {
 				return nil, wrapUnsupportedError(fmt.Errorf("can't invite non-user peer type %s", targetPeerType))
+			} else if tc.metadata.IsBot {
+				return nil, wrapUnsupportedError(fmt.Errorf("can't invite users as a bot"))
 			}
 			_, err = tc.client.API().MessagesAddChatUser(ctx, &tg.MessagesAddChatUserRequest{
 				ChatID:   chatID,
