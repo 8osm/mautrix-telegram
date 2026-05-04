@@ -42,7 +42,7 @@ require (
 	golang.org/x/sync v0.20.0
 	golang.org/x/tools v0.44.0
 	gopkg.in/yaml.v3 v3.0.1
-	maunium.net/go/mautrix v0.27.1-0.20260501211233-3b91c736c6ea
+	maunium.net/go/mautrix v0.27.1-0.20260504175020-82b195b797f1
 	rsc.io/qr v0.2.0
 )
 
@@ -70,7 +70,6 @@ require (
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/yuin/goldmark v1.8.2 // indirect
-	go.mau.fi/customresolver v0.0.0-20260501203937-b4612b0456c7 // indirect
 	go.mau.fi/zeroconfig v0.2.0 // indirect
 	go.uber.org/ratelimit v0.3.1 // indirect
 	golang.org/x/mod v0.35.0 // indirect
