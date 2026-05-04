@@ -261,16 +261,6 @@ func (tc *TelegramClient) GetCapabilities(ctx context.Context, portal *bridgev2.
 	}
 	portalMetadata := portal.Metadata.(*PortalMetadata)
 	peerType, _, topicID, _ := ids.ParsePortalID(portal.ID)
-	if topicID > 0 {
-		baseID += "+topic"
-		// TODO do topics have other changes?
-		delete(feat.State, event.StateRoomAvatar.Type)
-		delete(feat.State, event.StateBeeperDisappearingTimer.Type)
-		feat.DisappearingTimer = nil
-	} else if topicID == ids.TopicIDSpaceRoom {
-		baseID += "+spaceroom"
-		feat = &event.RoomFeatures{}
-	}
 	switch peerType {
 	case ids.PeerTypeChat:
 		feat.ID += "minigroup"
@@ -283,6 +273,7 @@ func (tc *TelegramClient) GetCapabilities(ctx context.Context, portal *bridgev2.
 		// Minigroups can always be deleted
 		feat.DeleteChatForEveryone = true
 	case ids.PeerTypeChannel:
+		feat.ID += "channel"
 		feat.MemberActions = map[event.MemberAction]event.CapabilitySupportLevel{
 			event.MemberActionBan:    event.CapLevelFullySupported,
 			event.MemberActionKick:   event.CapLevelFullySupported,
@@ -300,6 +291,16 @@ func (tc *TelegramClient) GetCapabilities(ctx context.Context, portal *bridgev2.
 		feat.State = event.StateFeatureMap{
 			event.StateBeeperDisappearingTimer.Type: {Level: event.CapLevelFullySupported},
 		}
+	}
+	if topicID > 0 {
+		baseID += "+topic"
+		// TODO do topics have other changes?
+		delete(feat.State, event.StateRoomAvatar.Type)
+		delete(feat.State, event.StateBeeperDisappearingTimer.Type)
+		feat.DisappearingTimer = nil
+	} else if topicID == ids.TopicIDSpaceRoom {
+		baseID += "+spaceroom"
+		feat = &event.RoomFeatures{}
 	}
 
 	feat.ID = baseID
