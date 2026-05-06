@@ -475,7 +475,7 @@ func (t *ReadyTransferer) ToDirectMediaResponse(ctx context.Context) (mediaproxy
 		Int("size", size).
 		Msg("Started downloading media successfully")
 
-	if t.expectedStickerConvertMime() != "" {
+	if convertTarget := t.expectedStickerConvertMime(); convertTarget != "" {
 		return &mediaproxy.GetMediaResponseFile{
 			Callback: func(w *os.File) (*mediaproxy.FileMeta, error) {
 				_, err = io.Copy(w, r)
@@ -486,6 +486,10 @@ func (t *ReadyTransferer) ToDirectMediaResponse(ctx context.Context) (mediaproxy
 				if err != nil {
 					return nil, fmt.Errorf("failed to seek to start of file for sticker conversion: %w", err)
 				}
+				log.Debug().
+					Str("source_mime", mimeType).
+					Str("target_mime", convertTarget).
+					Msg("Converting sticker for direct download")
 				var converted *ConvertedSticker
 				if t.inner.fileInfo.MimeType == "video/webm" {
 					converted = t.inner.animatedStickerConfig.convertWebm(ctx, w)
