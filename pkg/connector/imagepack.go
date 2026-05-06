@@ -38,12 +38,14 @@ import (
 	"go.mau.fi/util/variationselector"
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/id"
 
+	"go.mau.fi/mautrix-telegram/pkg/connector/humanise"
 	"go.mau.fi/mautrix-telegram/pkg/connector/media"
 	"go.mau.fi/mautrix-telegram/pkg/connector/store"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/telegram/uploader"
@@ -521,6 +523,9 @@ func (tc *TelegramClient) DownloadImagePack(ctx context.Context, url string) (*b
 	}
 	rawSet, err := tc.client.API().MessagesGetStickerSet(ctx, &tg.MessagesGetStickerSetRequest{Stickerset: &tg.InputStickerSetShortName{ShortName: shortName}})
 	if err != nil {
+		if tgerr.Is(err, tg.ErrStickersetInvalid) {
+			return nil, bridgev2.WrapRespErr(err, mautrix.MNotFound).WithMessage(humanise.Error(err))
+		}
 		return nil, err
 	}
 	set, ok := rawSet.(*tg.MessagesStickerSet)
