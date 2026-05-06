@@ -519,7 +519,7 @@ func (tc *TelegramClient) DownloadImagePack(ctx context.Context, url string) (*b
 	} else if packShortcodeRegex.MatchString(url) {
 		shortName = url
 	} else {
-		return nil, fmt.Errorf("invalid pack shortcode or link: %s", url)
+		return nil, bridgev2.RespError(mautrix.MNotFound.WithMessage("invalid pack shortcode or link: %s", url))
 	}
 	rawSet, err := tc.client.API().MessagesGetStickerSet(ctx, &tg.MessagesGetStickerSetRequest{Stickerset: &tg.InputStickerSetShortName{ShortName: shortName}})
 	if err != nil {
