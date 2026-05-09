@@ -257,6 +257,12 @@ func (tc *TelegramClient) convertToMatrix(
 			log.Warn().Type("reply_to", replyTo).Msg("unhandled reply to type")
 		}
 	}
+	if cm.Parts[0].Extra == nil {
+		cm.Parts[0].Extra = make(map[string]any)
+	}
+	if externalURL := getMessageLink(msg); externalURL != "" {
+		cm.Parts[0].Extra["external_url"] = externalURL
+	}
 	if len(cm.Parts) > 1 {
 		log.Warn().Int("part_count", len(cm.Parts)).Msg("Message has multiple parts")
 		for i, part := range cm.Parts[1:] {
@@ -272,6 +278,23 @@ func (tc *TelegramClient) convertToMatrix(
 	}
 
 	return
+}
+
+func getMessageLink(msg *tg.Message) string {
+	var chatID int64
+	switch peer := msg.PeerID.(type) {
+	case *tg.PeerChat:
+		chatID = peer.ChatID
+	case *tg.PeerChannel:
+		chatID = peer.ChannelID
+	default: // also PeerUser
+		return ""
+	}
+	topicID := rawGetTopicID(msg.ReplyTo)
+	if topicID > 0 {
+		return fmt.Sprintf("https://t.me/c/%d/%d/%d", chatID, topicID, msg.ID)
+	}
+	return fmt.Sprintf("https://t.me/c/%d/%d", chatID, msg.ID)
 }
 
 func (tc *TelegramClient) addForwardHeader(ctx context.Context, part *bridgev2.ConvertedMessagePart, fwd tg.MessageFwdHeader) error {
@@ -584,11 +607,10 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 				if a.RoundMessage {
 					extraInfo["fi.mau.telegram.round_message"] = a.RoundMessage
 				}
-				extraInfo["duration"] = int(a.Duration * 1000)
 			case *tg.DocumentAttributeAudio:
 				if content.MsgType != event.MsgVideo {
 					content.MsgType = event.MsgAudio
-					extraInfo["duration"] = int(a.Duration * 1000) // only set the duration is not already set by the video handling logic
+					transferer = transferer.WithAudio(a) // only set the duration is not already set by the video handling logic
 				}
 				content.MSC1767Audio = &event.MSC1767Audio{
 					Duration: a.Duration * 1000,
@@ -606,7 +628,7 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 				}
 			case *tg.DocumentAttributeImageSize:
 				transferer = transferer.WithImageSize(a)
-				if content.MsgType == event.MsgFile {
+				if content.MsgType == event.MsgFile && !isSticker {
 					content.MsgType = event.MsgImage
 					extra["fi.mau.telegram.force_document"] = true
 					defaultFileName = "image_document"
@@ -619,20 +641,9 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 					content.FileName = content.Body
 					content.Body = a.Alt
 				}
-				stickerInfo := map[string]any{"alt": a.Alt, "id": strconv.FormatInt(document.ID, 10)}
-
-				if setID, ok := a.Stickerset.(*tg.InputStickerSetID); ok {
-					stickerInfo["pack"] = map[string]any{
-						"id":          strconv.FormatInt(setID.ID, 10),
-						"access_hash": strconv.FormatInt(setID.AccessHash, 10),
-					}
-				} else if shortName, ok := a.Stickerset.(*tg.InputStickerSetShortName); ok {
-					stickerInfo["pack"] = map[string]any{
-						"short_name": shortName.ShortName,
-					}
-				}
-				extraInfo["fi.mau.telegram.sticker"] = stickerInfo
-				transferer = transferer.WithStickerConfig(tc.main.Config.AnimatedSticker)
+				transferer = transferer.
+					WithStickerConfig(tc.main.Config.AnimatedSticker).
+					WithStickerMetadata(tc.stickerSourceFromAttribute(ctx, document.ID, a))
 			case *tg.DocumentAttributeAnimated:
 				isVideoGif = true
 				extraInfo["fi.mau.telegram.gif"] = true
@@ -660,14 +671,6 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 				eventType = event.EventSticker
 				content.MsgType = "" // Strip the msgtype since that doesn't apply for stickers
 			}
-		}
-
-		if isVideoGif {
-			extraInfo["fi.mau.gif"] = true
-			extraInfo["fi.mau.loop"] = true
-			extraInfo["fi.mau.autoplay"] = true
-			extraInfo["fi.mau.hide_controls"] = true
-			extraInfo["fi.mau.no_audio"] = true
 		}
 
 		if _, ok := document.GetThumbs(); ok && eventType != event.EventSticker {
@@ -711,7 +714,7 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 	}
 
 	var err error
-	if tc.main.useDirectMedia && (!isSticker || tc.main.Config.AnimatedSticker.Target == "disable") {
+	if tc.main.useDirectMedia {
 		content.URL, content.Info, err = mediaTransferer.DirectDownloadURL(ctx, tc.telegramUserID, portal, msgID, false, telegramMediaID)
 		if err != nil {
 			log.Err(err).Msg("Failed to create direct download URL for media")
@@ -751,6 +754,13 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 			content.FileName = content.FileName + exmime.ExtensionFromMimetype(content.Info.MimeType)
 		}
 	}
+	if isVideoGif {
+		content.Info.MauGIF = true
+		extraInfo["fi.mau.loop"] = true
+		extraInfo["fi.mau.autoplay"] = true
+		extraInfo["fi.mau.hide_controls"] = true
+		extraInfo["fi.mau.no_audio"] = true
+	}
 
 	// Handle spoilers
 	// See: https://github.com/matrix-org/matrix-spec-proposals/pull/3725
@@ -762,7 +772,7 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 		extraInfo["fi.mau.telegram.spoiler"] = true
 	}
 	if len(extraInfo) > 0 {
-		extra["info"] = extraInfo
+		content.Info.Extra = extraInfo
 	}
 
 	converted = &bridgev2.ConvertedMessagePart{

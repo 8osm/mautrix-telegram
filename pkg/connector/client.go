@@ -40,13 +40,13 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/bridgev2/status"
-	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-telegram/pkg/connector/humanise"
 	"go.mau.fi/mautrix-telegram/pkg/connector/ids"
 	"go.mau.fi/mautrix-telegram/pkg/connector/matrixfmt"
 	"go.mau.fi/mautrix-telegram/pkg/connector/store"
 	"go.mau.fi/mautrix-telegram/pkg/connector/telegramfmt"
+	"go.mau.fi/mautrix-telegram/pkg/gotd/pool"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/telegram"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/telegram/auth"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/telegram/updates"
@@ -117,6 +117,10 @@ type TelegramClient struct {
 
 	prevReactionPoll     map[networkid.PortalKey]time.Time
 	prevReactionPollLock sync.Mutex
+
+	stickerPacksByName   map[string]*stickerPackCache
+	stickerPacksByID     map[int64]*stickerPackCache
+	stickerPackCacheLock sync.Mutex
 }
 
 var _ bridgev2.NetworkAPI = (*TelegramClient)(nil)
@@ -171,7 +175,9 @@ func NewTelegramClient(ctx context.Context, tc *TelegramConnector, login *bridge
 
 		takeoutAccepted: exsync.NewEvent(),
 
-		prevReactionPoll: map[networkid.PortalKey]time.Time{},
+		prevReactionPoll:   map[networkid.PortalKey]time.Time{},
+		stickerPacksByName: map[string]*stickerPackCache{},
+		stickerPacksByID:   map[int64]*stickerPackCache{},
 
 		recentMessageRooms: exsync.NewRingBuffer[networkid.MessageID, networkid.PortalKey](32),
 
@@ -341,29 +347,9 @@ func NewTelegramClient(ctx context.Context, tc *TelegramConnector, login *bridge
 		},
 	}
 	client.matrixParser = &matrixfmt.HTMLParser{
-		Store: tc.Store,
-		GetGhostDetails: func(ctx context.Context, portal *bridgev2.Portal, ui id.UserID) (networkid.UserID, string, int64, bool) {
-			userID, ok := tc.Bridge.Matrix.ParseGhostMXID(ui)
-			if !ok {
-				user, err := tc.Bridge.GetExistingUserByMXID(ctx, ui)
-				if err != nil || user == nil {
-					return "", "", 0, false
-				} else if login, _, _ := portal.FindPreferredLogin(ctx, user, false); login != nil {
-					userID = ids.UserLoginIDToUserID(login.ID)
-				} else {
-					return "", "", 0, false
-				}
-			}
-			if peerType, telegramUserID, err := ids.ParseUserID(userID); err != nil {
-				return "", "", 0, false
-			} else if accessHash, err := client.ScopedStore.GetAccessHash(ctx, peerType, telegramUserID); err != nil || accessHash == 0 {
-				return "", "", 0, false
-			} else if username, err := client.main.Store.Username.Get(ctx, peerType, telegramUserID); err != nil {
-				return "", "", 0, false
-			} else {
-				return userID, username, accessHash, true
-			}
-		},
+		Store:       tc.Store,
+		Bridge:      tc.Bridge,
+		ScopedStore: client.ScopedStore,
 	}
 
 	return &client, err
@@ -418,12 +404,12 @@ func (tc *TelegramClient) onPing() {
 	me, err := tc.client.Self(ctx)
 	if auth.IsUnauthorized(err) {
 		tc.onAuthError(err)
-	} else if errors.Is(err, syscall.EPIPE) {
-		// This is a pipe error, try disconnecting which will force the
-		// updatesManager to fail and cause the client to reconnect.
+	} else if errors.Is(err, syscall.EPIPE) || errors.Is(err, pool.ErrConnDead) {
+		// Connectivity error — connection died during the Self() call.
+		// Keep as transient; gotd's backoff will reconnect.
 		tc.userLogin.BridgeState.Send(status.BridgeState{
 			StateEvent: status.StateTransientDisconnect,
-			Error:      "pipe-error",
+			Error:      "connectivity-error",
 			Message:    humanise.Error(err),
 		})
 	} else if err != nil {

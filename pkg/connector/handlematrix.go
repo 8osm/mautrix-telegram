@@ -54,9 +54,11 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"go.mau.fi/mautrix-telegram/pkg/connector/media"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/telegram/message"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/telegram/uploader"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/tg"
+	"go.mau.fi/mautrix-telegram/pkg/gotd/tgerr"
 
 	"go.mau.fi/mautrix-telegram/pkg/connector/emojis"
 	"go.mau.fi/mautrix-telegram/pkg/connector/humanise"
@@ -78,6 +80,7 @@ var (
 	_ bridgev2.DeleteChatHandlingNetworkAPI     = (*TelegramClient)(nil)
 	_ bridgev2.RoomNameHandlingNetworkAPI       = (*TelegramClient)(nil)
 	_ bridgev2.RoomAvatarHandlingNetworkAPI     = (*TelegramClient)(nil)
+	_ bridgev2.MembershipHandlingNetworkAPI     = (*TelegramClient)(nil)
 )
 
 func getMediaFilename(content *event.MessageEventContent) (filename string) {
@@ -205,10 +208,17 @@ func (tc *TelegramClient) pollSponsoredMessage(ctx context.Context, portal *brid
 	return nil
 }
 
-func (tc *TelegramClient) transferMediaToTelegram(ctx context.Context, content *event.MessageEventContent, sticker, forceDocument bool) (tg.InputMediaClass, error) {
+func (tc *TelegramClient) transferMediaToTelegram(ctx context.Context, content *event.MessageEventContent, sticker, forceRetry, forceDocument bool) (tg.InputMediaClass, error) {
 	var upload tg.InputFileClass
 	filename := getMediaFilename(content)
 	info := content.GetInfo()
+	if sticker {
+		if origFile, err := tc.findOriginalStickerDocument(ctx, info.BridgedSticker, forceRetry); err != nil {
+			zerolog.Ctx(ctx).Err(err).Msg("Failed to find original sticker document, falling back to reupload")
+		} else if origFile != nil {
+			return origFile, nil
+		}
+	}
 	err := tc.main.Bridge.Bot.DownloadMediaToFile(ctx, content.URL, content.File, false, func(f *os.File) (err error) {
 		uploadFilename := f.Name()
 		if sticker && (info.MimeType == "image/png" || info.MimeType == "image/jpeg") {
@@ -230,10 +240,17 @@ func (tc *TelegramClient) transferMediaToTelegram(ctx context.Context, content *
 		} else if sticker && (info.MimeType != "video/webm" && info.MimeType != "application/x-tgsticker") {
 			uploadFilename, err = ffmpeg.ConvertPath(ctx, uploadFilename, ".webp", []string{}, []string{}, false)
 			if err != nil {
-				return fmt.Errorf("failed to convert sticker to webm: %+w", err)
+				return fmt.Errorf("failed to convert sticker to webm: %w", err)
 			}
 			defer os.Remove(uploadFilename)
 			info.MimeType = "image/webp"
+		} else if sticker && info.MimeType == "video/lottie+json" {
+			uploadFilename, err = media.CompressGZip(f)
+			if err != nil {
+				return fmt.Errorf("failed to compress lottie sticker: %w", err)
+			}
+			defer os.Remove(uploadFilename)
+			info.MimeType = "application/x-tgsticker"
 		} else if cfg, _, err := image.DecodeConfig(f); err != nil {
 			forceDocument = true
 		} else if fileInfo, err := f.Stat(); err != nil {
@@ -329,7 +346,10 @@ func (tc *TelegramClient) transferMediaToTelegram(ctx context.Context, content *
 	}, nil
 }
 
-func (tc *TelegramClient) humaniseSendError(err error) bridgev2.MessageStatus {
+func (tc *TelegramClient) humaniseSendError(err error) error {
+	if err == nil {
+		return nil
+	}
 	status := bridgev2.WrapErrorInStatus(err).
 		WithErrorReason(event.MessageStatusNetworkError).
 		WithMessage(humanise.Error(err))
@@ -374,6 +394,38 @@ func parseRandomID(txnID networkid.RawTransactionID) int64 {
 	return rand.Int64()
 }
 
+func (tc *TelegramClient) getMaxMessageLength(ctx context.Context, isMedia bool) (val int) {
+	if !isMedia {
+		return 4096
+	}
+	config, err := tc.getAppConfigCached(ctx)
+	if err != nil {
+		return 1024
+	}
+	myGhost, err := tc.main.Bridge.GetGhostByID(ctx, tc.userID)
+	if err != nil {
+		return 1024
+	}
+	isPremium := myGhost.Metadata.(*GhostMetadata).IsPremium
+	if isPremium {
+		val = 4096
+	} else {
+		val = 1024
+	}
+	tc.isPremiumCache.Store(isPremium)
+	var configLimit float64
+	var ok bool
+	if isPremium {
+		configLimit, ok = config["caption_length_limit_premium"].(float64)
+	} else {
+		configLimit, ok = config["caption_length_limit_default"].(float64)
+	}
+	if ok {
+		val = int(configLimit)
+	}
+	return
+}
+
 func (tc *TelegramClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (resp *bridgev2.MatrixMessageResponse, err error) {
 	if msg.Portal.RoomType == database.RoomTypeSpace {
 		return nil, fmt.Errorf("can't send messages to space portals")
@@ -398,7 +450,7 @@ func (tc *TelegramClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2
 
 	noWebpage := msg.Content.BeeperLinkPreviews != nil && len(msg.Content.BeeperLinkPreviews) == 0
 
-	message, entities := matrixfmt.Parse(ctx, tc.matrixParser, msg.Content, msg.Portal)
+	message, entities := matrixfmt.Parse(ctx, tc.matrixParser, msg.Content, msg.Portal, tc.getMaxMessageLength(ctx, msg.Content.MsgType.IsMedia()))
 
 	var replyTo tg.InputReplyToClass
 	if msg.ReplyTo != nil {
@@ -421,19 +473,26 @@ func (tc *TelegramClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2
 
 	var updates tg.UpdatesClass
 	if msg.Event.Type == event.EventSticker {
-		var media tg.InputMediaClass
-		media, err = tc.transferMediaToTelegram(ctx, msg.Content, true, false)
-		if err != nil {
-			return nil, err
-		}
-		updates, err = tc.client.API().MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
+		mediaReq := &tg.MessagesSendMediaRequest{
 			Peer:     peer,
 			Message:  message,
 			Entities: entities,
-			Media:    media,
 			ReplyTo:  replyTo,
 			RandomID: randomID,
-		})
+		}
+		mediaReq.Media, err = tc.transferMediaToTelegram(ctx, msg.Content, true, false, false)
+		if err != nil {
+			return nil, err
+		}
+		updates, err = tc.client.API().MessagesSendMedia(ctx, mediaReq)
+		if tgerr.Is(err, tg.ErrFileReferenceExpired) {
+			zerolog.Ctx(ctx).Debug().AnErr("send_error", err).Msg("Trying to refetch sticker pack")
+			mediaReq.Media, err = tc.transferMediaToTelegram(ctx, msg.Content, true, true, false)
+			if err != nil {
+				return nil, err
+			}
+			updates, err = tc.client.API().MessagesSendMedia(ctx, mediaReq)
+		}
 	} else {
 		switch msg.Content.MsgType {
 		case event.MsgText, event.MsgNotice, event.MsgEmote:
@@ -448,7 +507,7 @@ func (tc *TelegramClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2
 		case event.MsgImage, event.MsgFile, event.MsgAudio, event.MsgVideo:
 			var media tg.InputMediaClass
 			forceDocument, _ := msg.Event.Content.Raw["fi.mau.telegram.force_document"].(bool)
-			media, err = tc.transferMediaToTelegram(ctx, msg.Content, false, forceDocument)
+			media, err = tc.transferMediaToTelegram(ctx, msg.Content, false, false, forceDocument)
 			if err != nil {
 				return nil, err
 			}
@@ -593,7 +652,7 @@ func (tc *TelegramClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.Ma
 		return err
 	}
 
-	message, entities := matrixfmt.Parse(ctx, tc.matrixParser, msg.Content, msg.Portal)
+	message, entities := matrixfmt.Parse(ctx, tc.matrixParser, msg.Content, msg.Portal, tc.getMaxMessageLength(ctx, msg.Content.MsgType.IsMedia()))
 
 	var newContentURI id.ContentURIString
 	req := tg.MessagesEditMessageRequest{
@@ -613,7 +672,7 @@ func (tc *TelegramClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.Ma
 		} else {
 			log.Info().Msg("media URI changed, re-uploading media")
 			forceDocument, _ := msg.Event.Content.Raw["fi.mau.telegram.force_document"].(bool)
-			req.Media, err = tc.transferMediaToTelegram(ctx, msg.Content, false, forceDocument)
+			req.Media, err = tc.transferMediaToTelegram(ctx, msg.Content, false, false, forceDocument)
 			if err != nil {
 				return err
 			}
@@ -709,7 +768,7 @@ func (tc *TelegramClient) PreHandleMatrixReaction(ctx context.Context, msg *brid
 
 	keyNoVariation := variationselector.Remove(msg.Content.RelatesTo.Key)
 	emojiID := ids.MakeEmojiIDFromEmoticon(msg.Content.RelatesTo.Key)
-	if strings.HasPrefix(msg.Content.RelatesTo.Key, "mxc://") {
+	if strings.Contains(msg.Content.RelatesTo.Key, "://") {
 		if file, err := tc.main.Store.TelegramFile.GetByMXC(ctx, id.ContentURIString(msg.Content.RelatesTo.Key)); err != nil {
 			return resp, err
 		} else if file == nil {
@@ -1235,4 +1294,146 @@ func (tc *TelegramClient) HandleMatrixRoomAvatar(ctx context.Context, msg *bridg
 	default:
 		return false, fmt.Errorf("unsupported peer type %s for changing room avatar", peerType)
 	}
+}
+
+func wrapUnsupportedError(err error) bridgev2.MessageStatus {
+	return bridgev2.WrapErrorInStatus(err).
+		WithErrorReason(event.MessageStatusUnsupported).
+		WithIsCertain(true).
+		WithSendNotice(false)
+}
+
+func (tc *TelegramClient) HandleMatrixMembership(ctx context.Context, msg *bridgev2.MatrixMembershipChange) (*bridgev2.MatrixMembershipResult, error) {
+	if (msg.Type.IsSelf && msg.OrigSender != nil) || msg.Type == bridgev2.ProfileChange {
+		return nil, nil
+	}
+	chatPeerType, chatID, _, err := ids.ParsePortalID(msg.Portal.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse portal ID: %w", err)
+	}
+	var inputChannel *tg.InputChannel
+	switch chatPeerType {
+	case ids.PeerTypeUser:
+		return nil, nil
+	case ids.PeerTypeChannel:
+		if accessHash, err := tc.ScopedStore.GetAccessHash(ctx, ids.PeerTypeChannel, chatID); err != nil {
+			return nil, fmt.Errorf("failed to get access hash for channel: %w", err)
+		} else {
+			inputChannel = &tg.InputChannel{ChannelID: chatID, AccessHash: accessHash}
+		}
+	case ids.PeerTypeChat:
+		// ok
+	default:
+		return nil, wrapUnsupportedError(fmt.Errorf("unsupported chat peer type %s for membership changes", chatPeerType))
+	}
+	var targetPeerType ids.PeerType
+	var targetUserID int64
+	switch target := msg.Target.(type) {
+	case *bridgev2.UserLogin:
+		targetPeerType = ids.PeerTypeUser
+		targetUserID, err = ids.ParseUserLoginID(target.ID)
+	case *bridgev2.Ghost:
+		targetPeerType, targetUserID, err = ids.ParseUserID(target.ID)
+	default:
+		return nil, wrapUnsupportedError(fmt.Errorf("unknown membership target type %T", msg.Target))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse target login ID: %w", err)
+	}
+	targetAccessHash, err := tc.ScopedStore.GetAccessHash(ctx, targetPeerType, targetUserID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get access hash for target: %w", err)
+	}
+	var targetInputPeer tg.InputPeerClass
+	var targetInputUser *tg.InputUser
+	switch targetPeerType {
+	case ids.PeerTypeUser:
+		targetInputPeer = &tg.InputPeerUser{UserID: targetUserID, AccessHash: targetAccessHash}
+		targetInputUser = &tg.InputUser{UserID: targetUserID, AccessHash: targetAccessHash}
+	case ids.PeerTypeChannel:
+		targetInputPeer = &tg.InputPeerChannel{ChannelID: targetUserID, AccessHash: targetAccessHash}
+	default:
+		return nil, wrapUnsupportedError(fmt.Errorf("unsupported target peer type %s for membership changes", targetPeerType))
+	}
+	if chatPeerType == ids.PeerTypeChannel {
+		switch msg.Type {
+		case bridgev2.Kick, bridgev2.RejectKnock, bridgev2.RevokeInvite, bridgev2.BanLeft, bridgev2.BanJoined, bridgev2.BanInvited, bridgev2.BanKnocked:
+			_, err = tc.client.API().ChannelsEditBanned(ctx, &tg.ChannelsEditBannedRequest{
+				Channel:      inputChannel,
+				Participant:  targetInputPeer,
+				BannedRights: tg.ChatBannedRights{ViewMessages: true},
+			})
+			if err != nil {
+				err = tc.humaniseSendError(err)
+			} else if msg.Type == bridgev2.Kick {
+				// Reset permissions to default (telegram doesn't have a dedicated kick method)
+				_, err = tc.client.API().ChannelsEditBanned(ctx, &tg.ChannelsEditBannedRequest{
+					Channel:      inputChannel,
+					Participant:  targetInputPeer,
+					BannedRights: tg.ChatBannedRights{},
+				})
+				if err != nil {
+					err = tc.humaniseSendError(err)
+					return nil, fmt.Errorf("failed to unban user to emulate kick: %w", err)
+				}
+			}
+		case bridgev2.Unban:
+			_, err = tc.client.API().ChannelsEditBanned(ctx, &tg.ChannelsEditBannedRequest{
+				Channel:      inputChannel,
+				Participant:  targetInputPeer,
+				BannedRights: tg.ChatBannedRights{},
+			})
+			err = tc.humaniseSendError(err)
+		case bridgev2.Invite, bridgev2.AcceptKnock:
+			if targetInputUser == nil {
+				return nil, wrapUnsupportedError(fmt.Errorf("can't invite non-user peer type %s", targetPeerType))
+			} else if tc.metadata.IsBot {
+				return nil, wrapUnsupportedError(fmt.Errorf("can't invite users as a bot"))
+			}
+			_, err = tc.client.API().ChannelsInviteToChannel(ctx, &tg.ChannelsInviteToChannelRequest{
+				Channel: inputChannel,
+				Users:   []tg.InputUserClass{targetInputUser},
+			})
+			err = tc.humaniseSendError(err)
+		case bridgev2.Join, bridgev2.Knock:
+			_, err = tc.client.API().ChannelsJoinChannel(ctx, inputChannel)
+			err = tc.humaniseSendError(err)
+		case bridgev2.Leave, bridgev2.RetractKnock, bridgev2.RejectInvite:
+			_, err = tc.client.API().ChannelsLeaveChannel(ctx, inputChannel)
+			err = tc.humaniseSendError(err)
+		default:
+			err = wrapUnsupportedError(fmt.Errorf("unsupported channel membership change type %s -> %s", msg.Type.From, msg.Type.To))
+		}
+	} else {
+		switch msg.Type {
+		case bridgev2.Kick, bridgev2.RejectKnock, bridgev2.RevokeInvite, bridgev2.BanLeft, bridgev2.BanJoined, bridgev2.BanInvited, bridgev2.BanKnocked,
+			bridgev2.Leave, bridgev2.RetractKnock, bridgev2.RejectInvite:
+			_, err = tc.client.API().MessagesDeleteChatUser(ctx, &tg.MessagesDeleteChatUserRequest{
+				ChatID: chatID,
+				UserID: targetInputUser,
+			})
+			err = tc.humaniseSendError(err)
+		case bridgev2.Invite, bridgev2.AcceptKnock:
+			if targetInputUser == nil {
+				return nil, wrapUnsupportedError(fmt.Errorf("can't invite non-user peer type %s", targetPeerType))
+			} else if tc.metadata.IsBot {
+				return nil, wrapUnsupportedError(fmt.Errorf("can't invite users as a bot"))
+			}
+			_, err = tc.client.API().MessagesAddChatUser(ctx, &tg.MessagesAddChatUserRequest{
+				ChatID:   chatID,
+				UserID:   targetInputUser,
+				FwdLimit: 50,
+			})
+			err = tc.humaniseSendError(err)
+		case bridgev2.Join, bridgev2.Knock:
+			// TODO could maybe join if there's a saved invite link in the bridge db?
+			fallthrough
+		case bridgev2.Unban:
+			// There's no way to unban in minigroups
+			fallthrough
+		default:
+			err = wrapUnsupportedError(fmt.Errorf("unsupported minigroup membership change type %s -> %s", msg.Type.From, msg.Type.To))
+		}
+	}
+	return nil, err
 }
